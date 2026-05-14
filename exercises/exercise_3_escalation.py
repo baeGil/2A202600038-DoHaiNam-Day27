@@ -16,7 +16,7 @@ from langgraph.types import Command, interrupt
 from rich.console import Console
 from rich.panel import Panel
 
-from common.github import fetch_pr
+from common.github import fetch_pr, post_review_comment
 from common.llm import get_llm
 from common.schemas import (
     AUTO_APPROVE_THRESHOLD,
@@ -84,7 +84,8 @@ def node_synthesize(state: ReviewState) -> dict:
     #   - read state["escalation_answers"] (dict[question, answer])
     #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
     #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined, "final_action": "escalated_then_synthesized"}
+    #   - return {"analysis": refined}
+    # `node_commit` will then post the refined review to the PR.
     raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
 
 
@@ -100,11 +101,46 @@ def node_human_approval(state):
     return {"human_choice": response.get("choice"), "human_feedback": response.get("feedback")}
 
 
+def _render_comment_body(state) -> str:
+    a = state["analysis"]
+    lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
+    for c in a.comments:
+        lines.append(f"- **[{c.severity}]** `{c.file}:{c.line or '?'}` — {c.body}")
+    if state.get("human_feedback"):
+        lines.append(f"\n_Reviewer note: {state['human_feedback']}_")
+    if state.get("escalation_answers"):
+        lines.append("\n_Reviewer answered escalation questions:_")
+        for q, ans in state["escalation_answers"].items():
+            lines.append(f"> **{q}** {ans}")
+    return "\n".join(lines)
+
+
+def _post(state, label: str) -> str:
+    try:
+        post_review_comment(state["pr_url"], _render_comment_body(state))
+        console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
+        return label
+    except Exception as e:
+        console.print(f"  [red]✗[/red] post failed: {e}")
+        return "commit_failed"
+
+
 def node_commit(state):
-    return {"final_action": "committed" if state.get("human_choice") == "approve" else "rejected"}
+    console.print("[cyan]→ commit[/cyan]")
+    # Two paths converge here:
+    #   1. human_approval → commit (only post if approved)
+    #   2. escalate → synthesize → commit (always post the refined review)
+    if state.get("escalation_answers"):
+        return {"final_action": _post(state, "committed_after_escalation")}
+    if state.get("human_choice") == "approve":
+        return {"final_action": _post(state, "committed")}
+    console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
+    return {"final_action": "rejected"}
 
 
-def node_auto_approve(state): return {"final_action": "auto_approved"}
+def node_auto_approve(state):
+    console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
+    return {"final_action": _post(state, "auto_approved")}
 
 
 def build_graph():
@@ -125,7 +161,7 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → END
+    # TODO: wire escalate → synthesize → commit  (commit already → END)
     return g.compile(checkpointer=MemorySaver())
 
 

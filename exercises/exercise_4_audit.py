@@ -39,7 +39,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from common.db import db_path, write_audit_event
-from common.github import fetch_pr
+from common.github import fetch_pr, post_review_comment
 from common.llm import get_llm
 from common.schemas import (
     AUTO_APPROVE_THRESHOLD,
@@ -148,18 +148,52 @@ async def node_human_approval(state):
     return {"human_choice": resp.get("choice"), "human_feedback": resp.get("feedback")}
 
 
+def _render_comment_body(state) -> str:
+    a = state["analysis"]
+    lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
+    for c in a.comments:
+        lines.append(f"- **[{c.severity}]** `{c.file}:{c.line or '?'}` — {c.body}")
+    if state.get("human_feedback"):
+        lines.append(f"\n_Reviewer note: {state['human_feedback']}_")
+    if state.get("escalation_answers"):
+        lines.append("\n_Reviewer answered escalation questions:_")
+        for q, ans in state["escalation_answers"].items():
+            lines.append(f"> **{q}** {ans}")
+    return "\n".join(lines)
+
+
+def _post(state) -> str:
+    try:
+        post_review_comment(state["pr_url"], _render_comment_body(state))
+        console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
+        return "committed"
+    except Exception as e:
+        console.print(f"  [red]✗[/red] post failed: {e}")
+        return "commit_failed"
+
+
 async def node_commit(state):
+    console.print("[cyan]→ commit[/cyan]")
     t0 = time.monotonic()
-    action = "committed" if state.get("human_choice") == "approve" else "rejected"
+    # Two paths converge here:
+    #   1. human_approval → commit (only post if approved)
+    #   2. escalate → synthesize → commit (always post the refined review)
+    if state.get("escalation_answers") or state.get("human_choice") == "approve":
+        action = _post(state)
+    else:
+        console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
+        action = "rejected"
     # TODO: emit an AuditEntry summarising what was committed (or rejected).
     return {"final_action": action}
 
 
 async def node_auto_approve(state):
+    console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
     t0 = time.monotonic()
     a = state["analysis"]
+    action = _post(state)
     # TODO: emit an AuditEntry — no human was involved, decision is "auto".
-    return {"final_action": "auto_approved"}
+    return {"final_action": f"auto_{action}"}
 
 
 async def node_escalate(state):
@@ -196,7 +230,8 @@ async def node_synthesize(state):
     console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
     # TODO: emit an AuditEntry — use the NEW confidence (refined.confidence),
     #       which should be higher than the original analysis.
-    return {"analysis": refined, "final_action": "escalated_then_synthesized"}
+    # node_commit will run next and post the refined review to the PR.
+    return {"analysis": refined}
 
 
 def build_graph(checkpointer):
@@ -218,7 +253,7 @@ def build_graph(checkpointer):
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", "synthesize")
-    g.add_edge("synthesize", END)
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=checkpointer)
 
 

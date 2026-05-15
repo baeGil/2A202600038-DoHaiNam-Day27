@@ -63,17 +63,19 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {
+        "human_choice": response["choice"],
+        "human_feedback": response.get("feedback"),
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -87,28 +89,30 @@ def _render_comment_body(state: ReviewState) -> str:
     return "\n".join(lines)
 
 
-def _post(state: ReviewState, label: str) -> str:
-    """Post the review comment to the PR. Returns the final_action string."""
+def _post(state: ReviewState, label: str) -> tuple[str, str | None]:
+    """Post the review comment to the PR. Returns the final_action and URL."""
     try:
-        post_review_comment(state["pr_url"], _render_comment_body(state))
+        comment_url = post_review_comment(state["pr_url"], _render_comment_body(state))
         console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
-        return label
+        return label, comment_url
     except Exception as e:
         console.print(f"  [red]✗[/red] post failed: {e}")
-        return "commit_failed"
+        return "commit_failed", None
 
 
 def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
     if state.get("human_choice") == "approve":
-        return {"final_action": _post(state, "committed")}
+        action, url = _post(state, "committed")
+        return {"final_action": action, "posted_comment_url": url}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
 
 
 def node_auto_approve(state):
     console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
-    return {"final_action": _post(state, "auto_approved")}
+    action, url = _post(state, "auto_approved")
+    return {"final_action": action, "posted_comment_url": url}
 
 
 def node_escalate(state):     return {"final_action": "pending_escalation"}
@@ -133,8 +137,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -173,13 +176,10 @@ def main() -> None:
     console.print(f"[dim]thread_id = {thread_id}[/dim]\n")
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
-
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))

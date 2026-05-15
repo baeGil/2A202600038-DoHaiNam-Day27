@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 
 import httpx
 
@@ -93,7 +94,7 @@ def fetch_pr(pr_url: str) -> PullRequest:
     )
 
 
-def post_review_comment(pr_url: str, body: str) -> None:
+def post_review_comment(pr_url: str, body: str) -> str:
     """Post a top-level discussion comment back to the PR.
 
     Uses the Issues endpoint (PRs are issues under the hood for top-level
@@ -107,3 +108,20 @@ def post_review_comment(pr_url: str, body: str) -> None:
     with httpx.Client(timeout=30.0) as client:
         resp = client.post(url, headers=_headers(), json={"body": body})
         resp.raise_for_status()
+        return resp.json()["html_url"]
+
+
+@lru_cache(maxsize=1)
+def authenticated_user_login() -> str | None:
+    """Return the authenticated GitHub username when available.
+
+    This is used for audit logging so HITL events can be attributed even when
+    the caller does not explicitly set `GITHUB_USER` in the environment.
+    """
+    with httpx.Client(timeout=5.0) as client:
+        try:
+            resp = client.get(f"{API}/user", headers=_headers())
+            resp.raise_for_status()
+            return resp.json().get("login")
+        except Exception:
+            return os.environ.get("GITHUB_USER")

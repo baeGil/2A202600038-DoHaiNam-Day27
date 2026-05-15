@@ -1,4 +1,5 @@
 # Day27 — Track 3: HITL PR Review Agent
+Report: [`report.md`](report.md)
 
 A 2-hour lab that builds a human-in-the-loop pull-request review agent in **LangGraph**, end-to-end.
 
